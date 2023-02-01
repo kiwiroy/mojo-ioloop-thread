@@ -1,17 +1,13 @@
 package Mojo::IOLoop::Thread;
-use Mojo::Base 'Mojo::EventEmitter';
+use Mojo::Base 'Mojo::IOLoop::Subprocess';
 
 our $VERSION = "0.10";
 
 use threads;
 use Thread::Queue;
 
-use Scalar::Util qw(weaken);
 use Mojo::IOLoop;
-use Mojo::JSON;
-use Mojo::Promise;
-use Mojo::Util qw(monkey_patch);
-use YAML::Any qw(Dump);
+use Mojo::Util qw(dumper monkey_patch);
 
 BEGIN {
     ## no critic ( PrivateSubs )
@@ -23,69 +19,55 @@ BEGIN {
     }
 }
 
-has deserialize => sub { \&Mojo::JSON::decode_json };
-has ioloop      => sub { Mojo::IOLoop->singleton }, weak => 1;
-has serialize   => sub { \&Mojo::JSON::encode_json };
-
-sub exit_code { shift->{exit_code} }
-
 sub pid  { threads->tid() || shift->{pid}  };
-
-sub run {
-  my ($self, @args) = @_;
-  my $iol = $self->ioloop;
-  $self->ioloop->next_tick(sub { $self->_start(@args) if ref($args[0]) eq 'CODE'});
-  return $self;
-}
-
-sub run_p {
-  my ($self, $child) = @_;
-
-  my $p      = Mojo::Promise->new;
-  my $parent = sub {
-    my($self, $err) = (shift, shift);
-    $err ? $p->reject($err) : $p->resolve(@_);
-  };
-  $self->ioloop->next_tick(sub { $self->_start($child, $parent) });
-
-  return $p;
-}
 
 sub _start {
   my ($self, $child, $parent) = @_;
 
   $self->{queue} = Thread::Queue->new();
-  my $thr = threads->create(
-    {'exit' => 'thread_only'},
-    sub {
-      my($q) = @_;
-      $self->ioloop->reset({freeze => 1});
-      my $results = eval { [$self->$child] } // [];
-      $self->emit('cleanup');
-      return $self->serialize->([$@, @$results]);
-    },
-  );
-  $self->{pid} = $thr->tid();
+  my $tid = $self->{pid} = $self->_thread($child);
   $self->emit('spawn');
-
-  $self->{check} = sub {
+  
+  my $id;
+  $id = $self->ioloop->recurring(0.05 => sub {
+	my $ioloop = shift;
     while ( my $args = $self->{queue}->dequeue_nb() ) {
       $self->emit(progress => @$args);
     }
-    if ($thr->is_joinable()) {
-      my $results = eval { $self->deserialize->($thr->join()) } // [];
-      my $err = shift(@$results) // $@;
+	
+	return $ioloop->remove($id) unless my $thread = threads->object($tid);
+	
+	# warn join ',', $$, $id, threads->tid, $thread->tid, $self->{pid}, $thread->is_running,
+	#   $thread->is_joinable, "\n";
+    if ($thread->is_joinable() && !$thread->is_running && !$thread->is_detached) {
+	  $ioloop->remove($id);
+	  my $results = eval { $self->deserialize->($thread->join) } // [];
+	  my $err = shift(@$results) // $@;
       $self->{exit_code} = $err ? 1 : 0;
-      $self->$parent($err, @$results);
+	  $self->$parent($err, @$results);
     } else {
-      $self->ioloop->timer(0.05 => $self->{check});
       threads->yield();
     }
-  };
-
-  $self->ioloop->timer(0.05 => $self->{check});
+  });
 
   return $self;
+}
+
+sub _thread {
+  my $self   = shift;
+  my $child  = shift;
+  my $thread = threads->create(
+    {exit => 'thread_only', scalar => 1},
+    sub {
+      my ($self) = @_;
+      $self->ioloop->reset({freeze => !!(threads->tid)});
+      my $results = eval { [$self->$child] } // [];
+      $self->emit('cleanup');
+	  return $self->serialize->([$@, @$results]);
+    },
+	$self
+  );
+  return $thread->tid();
 }
 
 sub progress {
