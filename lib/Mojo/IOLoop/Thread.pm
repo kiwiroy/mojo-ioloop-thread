@@ -37,8 +37,6 @@ sub _start {
 	
 	return $ioloop->remove($id) unless my $thread = threads->object($tid);
 	
-	# warn join ',', $$, $id, threads->tid, $thread->tid, $self->{pid}, $thread->is_running,
-	#   $thread->is_joinable, "\n";
     if ($thread->is_joinable() && !$thread->is_running && !$thread->is_detached) {
 	  $ioloop->remove($id);
 	  my $results = eval { $self->deserialize->($thread->join) } // [];
